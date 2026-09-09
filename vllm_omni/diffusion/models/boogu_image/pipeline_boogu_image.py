@@ -531,15 +531,31 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         return height, width, ori_height, ori_width
 
     def predict(
-        self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_image_hidden_states=None
+        self,
+        t,
+        latents,
+        instruction_embeds,
+        freqs_cis,
+        instruction_attention_mask,
+        ref_image_hidden_states=None,
+        cache_branch=None,
     ):
         """One transformer velocity prediction (upstream ``predict``).
 
         ``ref_image_hidden_states`` is ``None`` for text-to-image, or the
         per-sample reference latents (``list[list[Tensor[C, H, W]]]``) for the
         image-editing path.
+
+        ``cache_branch`` tells TeaCacheHook which guidance branch this call
+        belongs to. Presence/absence of the reference latents changes the
+        joint token length, so branches that differ only by that (e.g. the
+        neg+ref vs. neg+no-ref pair in double guidance) must carry distinct
+        identities -- otherwise the hook's default positive/negative
+        alternation would reuse a residual cached for a differently-shaped
+        call.
         """
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
+        self.transformer.cache_branch_hint = cache_branch
         return self.transformer(
             latents,
             timestep,
@@ -723,11 +739,20 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 image_gs = image_guidance_scale if in_cfg_range else 1.0
 
                 model_pred = self.predict(
-                    t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_latents
+                    t,
+                    latents,
+                    instruction_embeds,
+                    freqs_cis,
+                    instruction_attention_mask,
+                    ref_latents,
+                    cache_branch="positive",
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
                     # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
+                    # The two negative-branch calls differ in whether the
+                    # reference latents are present, so they need distinct
+                    # cache identities (see ``predict``'s cache_branch note).
                     model_pred_drop_text = self.predict(
                         t,
                         latents,
@@ -735,6 +760,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         freqs_cis,
                         negative_instruction_attention_mask,
                         ref_latents,
+                        cache_branch="negative_ref",
                     )
                     model_pred_drop_all = self.predict(
                         t,
@@ -743,6 +769,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         freqs_cis,
                         negative_instruction_attention_mask,
                         None,
+                        cache_branch="negative_noref",
                     )
                     delta_text = model_pred - model_pred_drop_text
                     delta_image = model_pred_drop_text - model_pred_drop_all
@@ -756,12 +783,19 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         freqs_cis,
                         negative_instruction_attention_mask,
                         ref_latents,
+                        cache_branch="negative_ref",
                     )
                     model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_text)
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
                     model_pred_drop_image = self.predict(
-                        t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, None
+                        t,
+                        latents,
+                        instruction_embeds,
+                        freqs_cis,
+                        instruction_attention_mask,
+                        None,
+                        cache_branch="positive_noref",
                     )
                     model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
                 elif text_gs > 1.0:
@@ -773,6 +807,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         freqs_cis,
                         negative_instruction_attention_mask,
                         None,
+                        cache_branch="negative_noref",
                     )
                     model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_all)
 
