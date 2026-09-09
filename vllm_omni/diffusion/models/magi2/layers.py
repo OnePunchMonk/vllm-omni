@@ -43,6 +43,27 @@ def _quant_weight_dtype(quant_config: Any | None) -> torch.dtype | None:
     return WEIGHT_DTYPE_BY_QUANT_METHOD.get(get_name())
 
 
+def _quantize_weight_per_output_channel(
+    weight: torch.Tensor,
+    weight_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a linear weight with FP32 scales and arithmetic.
+
+    Checkpoints may be FP16. Computing a per-channel FP8 scale in that dtype
+    makes both the zero-row floor and small nonzero scales underflow before the
+    scale is saved as FP32.
+    """
+    weight_fp32 = weight.float()
+    if weight_dtype == torch.int8:
+        scale = weight_fp32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+        quantized = (weight_fp32 / scale).round().clamp(-127, 127).to(torch.int8)
+    else:
+        finfo = torch.finfo(weight_dtype)
+        scale = weight_fp32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
+        quantized = (weight_fp32 / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+    return quantized, scale
+
+
 def swiglu7(
     x: torch.Tensor,
     alpha: float = 1.702,
@@ -210,13 +231,7 @@ class Magi2GroupedLinear(nn.Module):
             return
         with torch.no_grad():
             grouped = self.weight.data.view(self.num_experts, self.local_out_features, self.local_in_features)
-            if weight_dtype == torch.int8:
-                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-                quantized = (grouped / scale).round().clamp(-127, 127).to(torch.int8)
-            else:
-                finfo = torch.finfo(weight_dtype)
-                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
-                quantized = (grouped / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+            quantized, scale = _quantize_weight_per_output_channel(grouped, weight_dtype)
         del self._parameters["weight"]
         self.register_buffer("weight_quantized", quantized)
         self.register_buffer("weight_scale", scale.to(torch.float32))
@@ -225,7 +240,7 @@ class Magi2GroupedLinear(nn.Module):
 
     def _grouped_weight(self, compute_dtype: torch.dtype) -> torch.Tensor:
         if self._quantized_dtype is not None:
-            return self.weight_quantized.to(compute_dtype) * self.weight_scale.to(compute_dtype)
+            return (self.weight_quantized.float() * self.weight_scale).to(compute_dtype)
         return self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
 
     def forward(
@@ -276,20 +291,13 @@ class QuantizedLinear(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         with torch.no_grad():
-            weight = linear.weight.data
-            if weight_dtype == torch.int8:
-                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-                quantized = (weight / scale).round().clamp(-127, 127).to(torch.int8)
-            else:
-                finfo = torch.finfo(weight_dtype)
-                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
-                quantized = (weight / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+            quantized, scale = _quantize_weight_per_output_channel(linear.weight.data, weight_dtype)
         self.register_buffer("weight_quantized", quantized)
         self.register_buffer("weight_scale", scale.to(torch.float32))
         self.bias = linear.bias
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        weight = self.weight_quantized.to(tensor.dtype) * self.weight_scale.to(tensor.dtype)
+        weight = (self.weight_quantized.float() * self.weight_scale).to(tensor.dtype)
         return F.linear(tensor, weight, self.bias)
 
 

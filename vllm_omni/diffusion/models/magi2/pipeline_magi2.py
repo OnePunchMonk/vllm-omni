@@ -57,6 +57,7 @@ from .configuration_magi2 import (
     MAGI2_GENERATION_CONFIG,
     MAGI2_PREVIEW_CONFIG,
 )
+from .layers import _quant_weight_dtype
 from .parallel import get_magi2_replica_group
 from .preview_data_proxy import Magi2DataProxy
 from .sampler_magi2 import (
@@ -602,7 +603,9 @@ class Magi2Pipeline(
             preview_config = dataclasses.replace(MAGI2_PREVIEW_CONFIG, quant_config=od_config.quantization_config)
         self._preview_config = preview_config
         mmap_dlo = bool(
-            od_config.enable_distributed_layerwise_offload and getattr(od_config, "dlo_use_allgather", True)
+            od_config.enable_distributed_layerwise_offload
+            and getattr(od_config, "dlo_use_allgather", True)
+            and _quant_weight_dtype(od_config.quantization_config) is None
         )
         if mmap_dlo:
             # AllGather DLO binds checkpoint tensors as mmap views and copies

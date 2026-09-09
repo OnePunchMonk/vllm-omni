@@ -31,6 +31,7 @@ from .layers import (
     MHCHandler,
     ModalityDispatcher,
     MultiModalityRMSNorm,
+    _quant_weight_dtype,
     make_grouped_linear,
     swiglu7,
 )
@@ -622,6 +623,9 @@ class Magi2PreviewTransformer(nn.Module):
         super().__init__()
         self.config = config or Magi2PreviewConfig()
         self.config.validate()
+        # This conversion happens after checkpoint loading. Direct mmap binds
+        # checkpoint tensors straight into DLO and would skip that conversion.
+        self.requires_ordinary_weight_loading = _quant_weight_dtype(self.config.quant_config) is not None
         self.pre_adapter = Magi2PreAdapter(self.config)
         self.post_adapter = Magi2PostAdapter(self.config)
         self.block = Magi2TransformerBlock(self.config)

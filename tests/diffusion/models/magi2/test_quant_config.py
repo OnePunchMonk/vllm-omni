@@ -208,3 +208,20 @@ def test_quantized_linear_forward_matches_unquantized_within_tolerance(quant_con
     expected = reference(x)
     actual = quantized_linear(x)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.float8_e4m3fn])
+def test_fp16_zero_and_small_rows_quantize_with_fp32_scales(weight_dtype) -> None:
+    linear = nn.Linear(4, 3, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        linear.weight.zero_()
+        linear.weight[1].fill_(1e-5)
+
+    quantized = QuantizedLinear(linear, weight_dtype)
+    assert torch.isfinite(quantized.weight_scale).all()
+    assert quantized.weight_scale[1].item() > 0
+
+    actual = quantized(torch.ones(1, 4, dtype=torch.float16))
+    assert torch.isfinite(actual).all()
+    assert actual[0, 0].item() == 0
+    assert actual[0, 1].item() > 0
